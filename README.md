@@ -36,13 +36,13 @@ python "3DIGA_from_images(1-6).py"
 ### KTP-J
 
 ```bash
-python "3DKTP_from_images(1-6).py" --prfk_acc_threshold 20 --prfk_theta_threshold 10 --prfk_dist_threshold 10 --prfk_dir_threshold 0.3
+python "3DKTP_from_images(1-6).py" --prfk_acc_threshold 0 --prfk_theta_threshold 0 --prfk_dist_threshold 0 --prfk_dir_threshold 0
 ```
 
 ### L2D-J
 
 ```bash
-python "3DIGA_from_images(1-6).py" --prfk_acc_threshold 20 --prfk_theta_threshold 10 --prfk_dist_threshold 10 --prfk_dir_threshold 0.3
+python "3DIGA_from_images(1-6).py" --prfk_acc_threshold 0 --prfk_theta_threshold 0 --prfk_dist_threshold 0 --prfk_dir_threshold 0
 ```
 
 未指定參數時，四個閾值預設皆為 `0`，代表所有幀都送入3D模型。
