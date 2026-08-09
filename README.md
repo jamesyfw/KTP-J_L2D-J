@@ -21,3 +21,28 @@ python "3DKTP_from_images(1-6).py"
 ```bash
 python "3DIGA_from_images(1-6).py"
 ```
+
+## 調整 PRFK 閾值
+
+四個閾值依序為：加速度、骨盆軸角度、移動距離、方向。
+
+```text
+--prfk_acc_threshold       加速度閾值
+--prfk_theta_threshold     骨盆軸角度閾值
+--prfk_dist_threshold      移動距離閾值
+--prfk_dir_threshold       方向閾值
+```
+
+### KTP-J
+
+```bash
+python "3DKTP_from_images(1-6).py" --prfk_acc_threshold 20 --prfk_theta_threshold 10 --prfk_dist_threshold 10 --prfk_dir_threshold 0.3
+```
+
+### L2D-J
+
+```bash
+python "3DIGA_from_images(1-6).py" --prfk_acc_threshold 20 --prfk_theta_threshold 10 --prfk_dist_threshold 10 --prfk_dir_threshold 0.3
+```
+
+未指定參數時，四個閾值預設皆為 `0`，代表所有幀都送入3D模型。
