@@ -1,5 +1,5 @@
-# 真正六點 KTP-J 正式驗證（S9+S11、全部4台攝影機、NPZ輸入）
-# python "3DKTP_from_images(1-6).py"
+# 六關節 L2D-J 正式驗證（S9+S11、全部4台攝影機、NPZ輸入）
+# python "3DL2D_from_images(1-6).py"
 
 import argparse
 import math
@@ -8,11 +8,9 @@ import time
 
 import numpy as np
 import torch
+import torch.nn as nn
+from einops import rearrange
 from thop import profile as thop_profile
-
-from common.graph_utils import adj_mx_from_skeleton, adj_mx_from_skeleton_temporal
-from common.model_ktpformer import KTPFormer
-from common.skeleton import Skeleton
 
 
 
@@ -515,9 +513,8 @@ class PRFKKeypointMonitor:
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-FULLBODY_WINDOW = 243
-HYBRID_CHECKPOINT_PATH = os.path.join(
-    PROJECT_ROOT, 'checkpoint_hybrid', 'KTP-J_best.bin'
+L2D_MODEL_PATH = os.path.join(
+    PROJECT_ROOT, 'checkpoint_hybrid', 'L2D-J_best.pth'
 )
 H36M_2D_NPZ_PATH = os.path.join(
     PROJECT_ROOT, 'data', 'data_2d_h36m_cpn_ft_h36m_dbb.npz'
@@ -525,6 +522,7 @@ H36M_2D_NPZ_PATH = os.path.join(
 H36M_3D_NPZ_PATH = os.path.join(
     PROJECT_ROOT, 'data', 'data_3d_h36m.npz'
 )
+IGA_WINDOW = 1
 PRFK_H36M_TO_COCO_IDS = [
     (11, 4), (13, 5), (15, 6),
     (12, 1), (14, 2), (16, 3),
@@ -536,26 +534,100 @@ LOWER_BODY_JOINT_ORDER = [
 LOWER_BODY_JOINT_TO_INDEX = {
     name: index for index, name in enumerate(LOWER_BODY_JOINT_ORDER)
 }
-VALIDATION_LOWER_INDICES = [1, 2, 3, 4, 5, 6]
+L2D_INPUT_H36M_INDICES = [1, 2, 3, 4, 5, 6]
 
 
 
-class MockRandomState:
-    def __setstate__(self, state):
-        pass
+class LowerBodyIGANet(nn.Module):
+    """Six-joint IGANet architecture used by L2D-J_best.pth."""
+
+    def __init__(self, depth=3, channel=512):
+        super().__init__()
+        from model.graph_frames import Graph
+        from model.model_IGANet import IGANet, encoder
+
+        full_adj = Graph('hm36_gt', 'spatial', pad=1).A
+        lower_adj = full_adj[
+            :,
+            L2D_INPUT_H36M_INDICES,
+            :,
+        ][
+            :,
+            :,
+            L2D_INPUT_H36M_INDICES,
+        ].copy()
+        column_mass = lower_adj.sum(axis=(0, 1), keepdims=True)
+        lower_adj = np.divide(
+            lower_adj,
+            column_mass,
+            out=np.zeros_like(lower_adj),
+            where=column_mass > 0,
+        )
+
+        self.A = nn.Parameter(
+            torch.tensor(lower_adj, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.encoder = encoder(2, channel // 2, channel)
+        self.IGANet = IGANet(
+            depth=depth,
+            embed_dim=channel,
+            adj=self.A,
+            length=len(L2D_INPUT_H36M_INDICES),
+        )
+        self.fcn = nn.Linear(channel, 3)
+        self.input_h36m_indices = tuple(L2D_INPUT_H36M_INDICES)
+        self.is_lower_body_model = True
+
+    def forward(self, x):
+        x = rearrange(x, 'b f j c -> (b f) j c').contiguous()
+        x = self.encoder(x)
+        x = self.IGANet(x)
+        x = self.fcn(x)
+        return rearrange(x, 'b j c -> b 1 j c').contiguous()
 
 
-def patched_randomstate_ctor(*args, **kwargs):
-    return MockRandomState()
+def load_h36m_data_helpers():
+    """使用專案內的 common/ 載入及正規化 Human3.6M。"""
+    from common.camera import normalize_screen_coordinates, world_to_camera
+    from common.h36m_dataset import Human36mDataset
 
+    def create_2d_data(data_path, dataset):
+        positions_2d = np.load(
+            data_path, allow_pickle=True
+        )['positions_2d'].item()
+        for subject in positions_2d:
+            for action in positions_2d[subject]:
+                for camera_index, keypoints in enumerate(
+                        positions_2d[subject][action]):
+                    camera = dataset.cameras()[subject][camera_index]
+                    keypoints = keypoints.copy()
+                    keypoints[..., :2] = normalize_screen_coordinates(
+                        keypoints[..., :2],
+                        w=camera['res_w'],
+                        h=camera['res_h'],
+                    )
+                    positions_2d[subject][action][camera_index] = keypoints
+        return positions_2d
 
-class MockMT19937:
-    def __setstate__(self, state):
-        pass
+    def read_3d_data(dataset):
+        for subject in dataset.subjects():
+            for action in dataset[subject]:
+                animation = dataset[subject][action]
+                positions_3d = []
+                for camera in animation['cameras']:
+                    position = world_to_camera(
+                        animation['positions'],
+                        R=camera['orientation'],
+                        t=camera['translation'],
+                    )
+                    position[:, :] -= position[:, :1]
+                    positions_3d.append(position)
+                animation['positions_3d'] = positions_3d
+        return dataset
 
+    return create_2d_data, read_3d_data, Human36mDataset
 
-def patched_bit_generator_ctor(*args, **kwargs):
-    return MockMT19937()
 
 
 def h36m_frame_to_prfk_payload(frame_2d, frame_index=None):
@@ -582,7 +654,7 @@ def build_prfk_update_plan(
         dir_threshold=0.0,
         acc_threshold=0.0,
         theta_threshold=0.0):
-    """Build a per-frame PRFK plan with both per-leg and combined lower-body joint changes."""
+    """Build a per-frame PRFK plan with combined lower-body joint changes."""
     # 四個閾值同時為0代表PRFK不篩除任何幀，所有輸入都送入3D模型。
     if all(abs(float(value)) < 1e-12 for value in (
             dist_threshold, dir_threshold, acc_threshold, theta_threshold)):
@@ -631,366 +703,257 @@ def build_prfk_update_plan(
     return frame_plan
 
 
-def build_validation_hybrid_model(checkpoint_path):
-    """建立checkpoint實際使用的17關節、243幀Hybrid GCN+TPA模型。"""
+def compute_iga_flops_per_frame(model):
+    """Compute IGA FLOPs for a single frame (IGA is single-frame model)."""
     import copy
-    import numpy.random._pickle
+    try:
+        if isinstance(model, (torch.jit.ScriptModule, torch.jit.RecursiveScriptModule)):
+            raise TypeError('thop does not support TorchScript models')
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        inner = model.module if hasattr(model, 'module') else model
+        input_indices = getattr(inner, 'input_h36m_indices', None)
+        joint_count = len(input_indices) if input_indices is not None else 17
+        dummy = torch.randn(
+            1,
+            1,
+            joint_count,
+            2,
+            device=device,
+        )
+        inner_copy = copy.deepcopy(inner).to(device)
+        flops, _ = thop_profile(inner_copy, inputs=(dummy,), verbose=False)
+        del inner_copy
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return flops
+    except Exception as e:
+        print(f"[WARNING] Failed to compute IGA FLOPs dynamically: {e}")
+        print("[WARNING] Using fallback value 0.0 GFLOPs")
+        return 0.0
 
-    # 17點Human3.6M空間圖，與run_hybrid.py訓練時相同。
-    spatial_skeleton = Skeleton(
-        parents=[-1, 0, 1, -1, 3, 4],
-        joints_left=[3, 4, 5],
-        joints_right=[0, 1, 2],
-    )
-    spatial_adj = adj_mx_from_skeleton(spatial_skeleton)
 
-    # checkpoint檔名中的f_243代表一次輸入243幀。
-    temporal_parents = np.arange(FULLBODY_WINDOW) - 1
-    temporal_adj = adj_mx_from_skeleton_temporal(
-        FULLBODY_WINDOW,
-        temporal_parents,
-    )
-    model = KTPFormer(
-        spatial_adj,
-        temporal_adj,
-        num_frame=FULLBODY_WINDOW,
-        num_joints=6,
-        in_chans=2,
-        embed_dim_ratio=512,
-        depth=7,
-        num_heads=8,
-        mlp_ratio=2.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop_path_rate=0.0,
-    )
+def _select_output(pred):
+    """Extract 3D output from model (single-frame model outputs already (B, 1, J, 3))."""
+    if pred.ndim == 4 and pred.shape[1] == 1:
+        return pred  # Already (B, 1, J, 3)
+    if pred.ndim == 3:
+        return pred.unsqueeze(1)  # (B, J, 3) -> (B, 1, J, 3)
+    raise ValueError(f"Unexpected prediction shape: {tuple(pred.shape)}")
 
-    # 相容舊checkpoint內的NumPy random_state pickle。
-    numpy.random._pickle.__randomstate_ctor = patched_randomstate_ctor
-    numpy.random._pickle.__bit_generator_ctor = patched_bit_generator_ctor
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location='cpu',
-        weights_only=False,
-    )
-    state = {
-        key.removeprefix('module.'): value
-        for key, value in checkpoint['model_pos'].items()
-    }
-    spatial_position = [
-        value for key, value in state.items()
-        if key.endswith('Spatial_pos_embed')
-    ]
-    if not spatial_position or spatial_position[0].shape[1] != 6:
+
+def select_model_2d_input(points_2d, model):
+    """只選出實際送入六關節模型的2D點，並檢查輸入形狀。"""
+    if points_2d.ndim != 3 or points_2d.shape[-1] != 2:
         raise ValueError(
-            f'Checkpoint is not a true six-joint KTPFormer: {checkpoint_path}'
+            f'Expected 2D input shape (frames, joints, 2), got '
+            f'{tuple(points_2d.shape)}'
         )
-    model.load_state_dict(state, strict=True)
 
+    input_indices = getattr(model, 'input_h36m_indices', None)
+    expected_joints = len(input_indices) if input_indices is not None else 17
+    source_joint_count = points_2d.shape[1]
+    if source_joint_count == expected_joints:
+        # 自訂輸入本來就是6點，不需要再次切片。
+        selected = points_2d
+        selection_text = 'input already has the expected joints'
+    elif input_indices is not None and max(input_indices) < source_joint_count:
+        # Human3.6M NPZ原本有17點；這裡只取index 1～6。
+        # 切片後才會轉成PyTorch tensor並送入IGANet。
+        selected = points_2d[:, list(input_indices), :]
+        selection_text = f'selected H36M indices {list(input_indices)}'
+    else:
+        raise ValueError(
+            f'Model requires {expected_joints} joints, but input has '
+            f'{source_joint_count}'
+        )
+
+    # 若不是6點就立即停止，避免不小心把17點送進L2D模型。
+    assert selected.shape[1] == expected_joints
+    if not getattr(model, '_input_shape_logged', False):
+        print(
+            '[INPUT CHECK] '
+            f'original={tuple(points_2d.shape)} | {selection_text} | '
+            f'model_input={tuple(selected.shape)}',
+            flush=True,
+        )
+        model._input_shape_logged = True
+    return np.ascontiguousarray(selected)
+
+
+def run_iga_inference(pts_2d_norm, frame_plan, iga_model, use_prfk=True, pred_cache=None):
+    """Run IGA inference frame-by-frame (single-frame model)."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device).eval()
 
-    # THOP量測一次完整(1,243,17,2) forward；使用副本，避免統計用
-    # buffer或hook進入實際驗證模型。
-    profile_model = copy.deepcopy(model).to(device).eval()
-    dummy = torch.randn(
-        1,
-        FULLBODY_WINDOW,
-        6,
-        2,
-        device=device,
-    )
+    predicted_frames = []
+    last_pred = None
+    num_updates = 0
+    num_skips = 0
+    t_3d_start = time.time()
+
     with torch.no_grad():
-        macs_per_call, params = thop_profile(
-            profile_model,
-            inputs=(dummy,),
-            verbose=False,
-        )
-    del profile_model, dummy
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
+        for i, info in enumerate(frame_plan):
+            should_update = True if not use_prfk else bool(info['any_update'])
 
+            if not should_update and last_pred is not None:
+                num_skips += 1
+                predicted_frames.append(last_pred)
+                continue
+
+            if pred_cache is not None and i in pred_cache:
+                pred_3d = pred_cache[i]
+            else:
+                frame_np = pts_2d_norm[i:i+1]
+                frame_np = select_model_2d_input(frame_np, iga_model)
+                frame_2d = (
+                    torch.from_numpy(frame_np)
+                    .float()
+                    .unsqueeze(1)
+                    .to(device)
+                )
+                pred = iga_model(frame_2d)
+                pred_3d = _select_output(pred)  # (B, 1, J, 3)
+                
+                if pred_cache is not None:
+                    pred_cache[i] = pred_3d
+
+            last_pred = pred_3d
+            predicted_frames.append(pred_3d)
+            num_updates += 1
+
+    predicted_3d = torch.cat(predicted_frames, dim=1)  # (1, T=num_frames, J, 3)
+    
+    t_3d = time.time() - t_3d_start
+
+    return predicted_3d, t_3d, num_updates, num_skips
+
+
+def run_iga_inference_batched(
+        pts_2d_norm,
+        frame_plan,
+        iga_model,
+        use_prfk=True,
+        batch_size=2048):
+    """Run update frames in batches, then apply PRFK hold-last routing."""
+    device = next(iga_model.parameters()).device
+    num_frames = len(pts_2d_norm)
+
+    update_indices = []
+    has_prediction = False
+    for index, info in enumerate(frame_plan):
+        should_update = True if not use_prfk else bool(info['any_update'])
+        if should_update or not has_prediction:
+            update_indices.append(index)
+            has_prediction = True
+
+    selected = select_model_2d_input(
+        pts_2d_norm[update_indices],
+        iga_model,
+    )
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    t_3d_start = time.perf_counter()
+    predicted_updates = []
+    with torch.no_grad():
+        for start in range(0, len(selected), batch_size):
+            batch = torch.from_numpy(
+                np.ascontiguousarray(selected[start:start + batch_size])
+            ).float().unsqueeze(1).to(device)
+            prediction = _select_output(iga_model(batch))[:, 0]
+            predicted_updates.append(prediction.float().cpu().numpy())
+
+    predicted_updates = np.concatenate(predicted_updates, axis=0)
+    predicted_all = np.empty(
+        (num_frames, predicted_updates.shape[1], 3),
+        dtype=np.float32,
+    )
+    update_cursor = 0
+    current_prediction = None
+    update_set = set(update_indices)
+    for index in range(num_frames):
+        if index in update_set:
+            current_prediction = predicted_updates[update_cursor]
+            update_cursor += 1
+        predicted_all[index] = current_prediction
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - t_3d_start
+    num_updates = len(update_indices)
     return (
-        model,
-        device,
-        int(checkpoint.get('epoch', -1)),
-        float(macs_per_call),
-        float(params),
+        torch.from_numpy(predicted_all).unsqueeze(0),
+        elapsed,
+        num_updates,
+        num_frames - num_updates,
     )
 
 
-def run_npz_hybrid_validation(args):
-    """用S9+S11的CPN 2D與3D GT驗證Hybrid模型的下半身六點。"""
-    from common.camera import (
-        normalize_screen_coordinates as h36m_normalize_2d,
-        world_to_camera,
-    )
-    from common.h36m_dataset import Human36mDataset
+def build_iga_model(checkpoint_path, num_frame=IGA_WINDOW):
+    """Load either the original 17-joint IGANet or six-joint L2D model."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # 1. 讀取2D NPZ與3D NPZ。
-    # positions_2d[subject][action][camera]形狀為(frames,17,2)。
-    positions_2d = np.load(
-        args.npz_path,
-        allow_pickle=True,
-    )['positions_2d'].item()
-    dataset = Human36mDataset(args.npz_3d_path)
-    subjects = [
-        value.strip()
-        for value in args.subject.split(',')
-        if value.strip()
-    ]
-    for subject in subjects:
-        if subject not in positions_2d:
-            raise KeyError(f'{subject} is not in {args.npz_path}')
-
-    print('[NPZ Hybrid validation] Loading model...', flush=True)
-    model, device, epoch, macs_per_call, params = (
-        build_validation_hybrid_model(args.checkpoint_hybrid)
-    )
-    print(
-        f'[INFO] Strict checkpoint load passed | epoch={epoch} | '
-        f'parameters={params / 1e6:.6f} M',
-        flush=True,
-    )
-
-    input_chunks = []
-    gt_chunks = []
-    valid_lengths = []
-    plan_chunks = []
-    sequence_start_flags = []
-    sequence_count = 0
-    total_frames = 0
-
-    # 2. 依subject -> action -> camera配對2D與3D。
-    # --camera_idx -1表示全部四台攝影機。
-    for subject in subjects:
-        for action_name in sorted(positions_2d[subject]):
-            cameras_2d = positions_2d[subject][action_name]
-            cameras = dataset[subject][action_name]['cameras']
-            positions_world = dataset[subject][action_name]['positions']
-            if args.camera_idx == -1:
-                camera_indices = range(len(cameras_2d))
-            elif 0 <= args.camera_idx < len(cameras_2d):
-                camera_indices = [args.camera_idx]
-            else:
-                raise IndexError(
-                    f'Camera {args.camera_idx} is unavailable for '
-                    f'{subject}/{action_name}'
-                )
-
-            for camera_idx in camera_indices:
-                camera = cameras[camera_idx]
-                sequence_2d_raw = cameras_2d[camera_idx].copy()
-                sequence_2d = sequence_2d_raw.copy()
-                sequence_2d[..., :2] = h36m_normalize_2d(
-                    sequence_2d[..., :2],
-                    w=camera['res_w'],
-                    h=camera['res_h'],
-                )
-
-                # 世界3D座標轉成攝影機座標，再扣除joint 0骨盆位置。
-                sequence_3d = world_to_camera(
-                    positions_world,
-                    R=camera['orientation'],
-                    t=camera['translation'],
-                )
-                sequence_3d[:, 1:] -= sequence_3d[:, :1]
-                sequence_3d[:, 0] = 0
-
-                # CPN與3D GT部分序列尾端相差一幀，只取共同長度。
-                length = min(len(sequence_2d), len(sequence_3d))
-                frame_plan = build_prfk_update_plan(
-                    sequence_2d_raw[:length, :, :2],
-                    dist_threshold=args.prfk_dist_threshold,
-                    dir_threshold=args.prfk_dir_threshold,
-                    acc_threshold=args.prfk_acc_threshold,
-                    theta_threshold=args.prfk_theta_threshold,
-                )
-                # 真正六點輸入：送進模型前就移除另外11個2D關節。
-                sequence_2d = sequence_2d[
-                    :length,
-                    VALIDATION_LOWER_INDICES,
-                    :2,
-                ].astype(np.float32)
-                sequence_3d = sequence_3d[:length].astype(np.float32)
-                sequence_count += 1
-                total_frames += length
-
-                # 3. Hybrid checkpoint是17點、243幀模型。
-                # 最後不足243幀時複製尾幀補齊，但補幀不計入MPJPE。
-                # 模型輸出17點後，只取[1,2,3,4,5,6]計分。
-                for start in range(0, length, FULLBODY_WINDOW):
-                    end = min(start + FULLBODY_WINDOW, length)
-                    valid_length = end - start
-                    chunk_2d = sequence_2d[start:end]
-                    chunk_gt = sequence_3d[
-                        start:end,
-                        VALIDATION_LOWER_INDICES,
-                        :,
-                    ]
-                    if valid_length < FULLBODY_WINDOW:
-                        pad_length = FULLBODY_WINDOW - valid_length
-                        chunk_2d = np.pad(
-                            chunk_2d,
-                            ((0, pad_length), (0, 0), (0, 0)),
-                            mode='edge',
-                        )
-                        chunk_gt = np.pad(
-                            chunk_gt,
-                            ((0, pad_length), (0, 0), (0, 0)),
-                            mode='edge',
-                        )
-                    input_chunks.append(chunk_2d)
-                    gt_chunks.append(chunk_gt)
-                    valid_lengths.append(valid_length)
-                    plan_chunks.append(frame_plan[start:end])
-                    sequence_start_flags.append(start == 0)
-
-    print(
-        '[INPUT CHECK] NPZ=(frames,17,2) | '
-        'selected_2d=(frames,6,2) | '
-        'model_input=(batch,243,6,2) | '
-        'model_output=(batch,243,6,3)',
-        flush=True,
-    )
-
-    # 4. 僅執行含有PRFK更新幀的243幀區塊；未更新幀沿用前次六點3D快取。
-    chunks_to_run = [
-        chunk_index
-        for chunk_index, chunk_plan in enumerate(plan_chunks)
-        if (
-            sequence_start_flags[chunk_index]
-            or any(item.get('any_update', False) for item in chunk_plan)
+    is_l2d = (
+        isinstance(checkpoint, dict)
+        and 'model_pos' in checkpoint
+        and (
+            checkpoint.get('input_shape') == [1, 1, 6, 2]
+            or checkpoint.get('lower_body_indices') == [1, 2, 3, 4, 5, 6]
         )
-    ]
-    predictions_by_chunk = {}
-    if device.type == 'cuda':
-        torch.cuda.synchronize(device)
-    inference_start = time.perf_counter()
-    with torch.no_grad():
-        for batch_start in range(
-                0,
-                len(chunks_to_run),
-                args.eval_batch_size):
-            batch_end = min(
-                batch_start + args.eval_batch_size,
-                len(chunks_to_run),
-            )
-            batch_chunk_indices = chunks_to_run[batch_start:batch_end]
-            input_batch = torch.from_numpy(
-                np.stack([
-                    input_chunks[index]
-                    for index in batch_chunk_indices
-                ])
-            ).to(device)
-            with torch.amp.autocast(
-                    device_type='cuda',
-                    enabled=device.type == 'cuda'):
-                prediction = model(input_batch)
-            prediction = prediction.float().cpu()
-            for local_index, chunk_index in enumerate(batch_chunk_indices):
-                predictions_by_chunk[chunk_index] = prediction[local_index]
-
-    if device.type == 'cuda':
-        torch.cuda.synchronize(device)
-    inference_seconds = time.perf_counter() - inference_start
-
-    joint_error_sum = torch.zeros(6, dtype=torch.float64)
-    update_frames = 0
-    skipped_frames = 0
-    cached_prediction = None
-    for chunk_index, chunk_plan in enumerate(plan_chunks):
-        if sequence_start_flags[chunk_index]:
-            cached_prediction = None
-
-        raw_prediction = predictions_by_chunk.get(chunk_index)
-        valid_length = valid_lengths[chunk_index]
-        target = torch.from_numpy(gt_chunks[chunk_index][:valid_length])
-        effective_prediction = []
-
-        for frame_offset in range(valid_length):
-            should_update = chunk_plan[frame_offset].get('any_update', False)
-            if should_update:
-                if raw_prediction is None:
-                    raise RuntimeError(
-                        'PRFK requested an update in a skipped KTP chunk'
-                    )
-                cached_prediction = raw_prediction[frame_offset]
-                update_frames += 1
-            else:
-                skipped_frames += 1
-
-            if cached_prediction is None:
-                raise RuntimeError(
-                    'KTP prediction cache is empty at the start of a sequence'
-                )
-            effective_prediction.append(cached_prediction)
-
-        effective_prediction = torch.stack(effective_prediction, dim=0)
-        errors = torch.linalg.vector_norm(
-            effective_prediction - target,
-            dim=-1,
-        )
-        joint_error_sum += errors.double().sum(dim=0)
-
-    per_joint_mpjpe = joint_error_sum / total_frames * 1000.0
-    combined_mpjpe = per_joint_mpjpe.mean().item()
-
-    model_calls = len(chunks_to_run)
-    total_macs = model_calls * macs_per_call
-    arithmetic_flops_total = 2.0 * total_macs
-    actual_macs_per_frame = total_macs / total_frames
-    joint_names = [
-        'R-Hip', 'R-Knee', 'R-Ankle',
-        'L-Hip', 'L-Knee', 'L-Ankle',
-    ]
-
-    print('=' * 72)
-    print(f'2D input: {args.npz_path}')
-    print(f'3D ground truth: {args.npz_3d_path}')
-    print(f'Checkpoint: {args.checkpoint_hybrid}')
-    print(
-        f'Subjects: {",".join(subjects)} | camera index: '
-        f'{args.camera_idx} | sequences: {sequence_count}'
     )
+
+    if is_l2d:
+        model = LowerBodyIGANet()
+        state_dict = checkpoint['model_pos']
+        print('[INFO] Building six-joint L2D IGANet')
+    else:
+        try:
+            from model.model_IGANet import Model as IGANetModel
+            print("[INFO] Building original 17-joint IGANet")
+        except Exception as e:
+            print(f"[ERROR] Failed to import IGANet model: {e}")
+            raise
+
+        class Args:
+            layers = 3
+            channel = 512
+            n_joints = 17
+
+        model = IGANetModel(Args())
+        model.input_h36m_indices = None
+        model.is_lower_body_model = False
+
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif isinstance(checkpoint, dict) and 'model_pos' in checkpoint:
+            state_dict = checkpoint['model_pos']
+        elif isinstance(checkpoint, dict) and 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint and not is_l2d:
+        state_dict = checkpoint['state_dict']
+
+    # Remove 'module.' prefix if present (from DataParallel)
+    if (
+            isinstance(state_dict, dict)
+            and state_dict
+            and list(state_dict.keys())[0].startswith('module.')):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+    # Load to device and model
+    model = model.to(device)
+    load_result = model.load_state_dict(state_dict, strict=is_l2d)
     print(
-        'PRFK thresholds: '
-        f'acceleration={args.prfk_acc_threshold:g}, '
-        f'theta={args.prfk_theta_threshold:g}, '
-        f'distance={args.prfk_dist_threshold:g}, '
-        f'direction={args.prfk_dir_threshold:g}'
+        f"[INFO] IGANet checkpoint loaded successfully: {checkpoint_path}"
     )
-    print('Model input per call: (1,243,6,2)')
-    print('Metric joints: [R-Hip,R-Knee,R-Ankle,L-Hip,L-Knee,L-Ankle]')
-    print(f'Total real frames: {total_frames}')
-    print(f'PRFK updates: {update_frames}; skips: {skipped_frames}')
-    print(f'Baseline 243-frame chunks: {len(input_chunks)}')
-    print(f'True six-joint KTP 243-frame calls: {model_calls}')
-    print(f'Six-joint KTP per call: {macs_per_call / 1e9:.6f} GMac')
-    print(
-        f'Theoretical per output frame: '
-        f'{macs_per_call / FULLBODY_WINDOW / 1e6:.6f} MMac/frame'
-    )
-    print(
-        f'Actual including final-chunk padding: '
-        f'{actual_macs_per_frame / 1e6:.6f} MMac/real frame'
-    )
-    print(f'Total arithmetic FLOPs: {arithmetic_flops_total / 1e12:.6f} TFLOPs')
-    print('=' * 72)
-    print(
-        'FINAL TRUE SIX-JOINT KTP VALIDATION MPJPE '
-        f'({"+".join(subjects)})'
-    )
-    print('=' * 72)
-    for joint_name, error in zip(joint_names, per_joint_mpjpe):
-        print(f'{joint_name:<8}: {error.item():.6f} mm')
-    print(f'Combined lower-body MPJPE: {combined_mpjpe:.6f} mm')
-    print(f'Actual 3D inference time: {inference_seconds:.3f} s')
-    print(
-        f'Average 3D inference time: '
-        f'{inference_seconds / total_frames * 1000.0:.6f} ms/frame'
-    )
-    return
+    if not is_l2d and (load_result.missing_keys or load_result.unexpected_keys):
+        print(f'[WARNING] Missing keys: {load_result.missing_keys}')
+        print(f'[WARNING] Unexpected keys: {load_result.unexpected_keys}')
+
+    model.eval()
+    return model
 
 
 def evaluate():
@@ -999,15 +962,243 @@ def evaluate():
     parser.add_argument('--npz_3d_path', default=H36M_3D_NPZ_PATH)
     parser.add_argument('--subject', default='S9,S11')
     parser.add_argument('--camera_idx', type=int, default=-1)
-    parser.add_argument('--checkpoint_hybrid', default=HYBRID_CHECKPOINT_PATH)
-    parser.add_argument('--eval_batch_size', type=int, default=8)
+    parser.add_argument('--checkpoint_hybrid', default=L2D_MODEL_PATH)
     parser.add_argument('--prfk_acc_threshold', type=float, default=0.0)
     parser.add_argument('--prfk_theta_threshold', type=float, default=0.0)
     parser.add_argument('--prfk_dist_threshold', type=float, default=0.0)
     parser.add_argument('--prfk_dir_threshold', type=float, default=0.0)
     args = parser.parse_args()
 
-    run_npz_hybrid_validation(args)
+    # --------------------------------------------------------------
+    # 1. 讀取 Human3.6M CPN 2D NPZ。
+    #
+    # positions_2d 的資料階層為：
+    # positions_2d[subject][action][camera]
+    # 每段陣列形狀為 (frames, 17, 2)，座標仍是影像像素。
+    # --------------------------------------------------------------
+    raw_positions_2d = np.load(
+        args.npz_path,
+        allow_pickle=True,
+    )['positions_2d'].item()
+    subjects = [
+        value.strip()
+        for value in args.subject.split(',')
+        if value.strip()
+    ]
+    missing_subjects = [
+        subject
+        for subject in subjects
+        if subject not in raw_positions_2d
+    ]
+    if missing_subjects:
+        raise KeyError(
+            f'Subjects {missing_subjects!r} are not in {args.npz_path}'
+        )
+
+    # --------------------------------------------------------------
+    # 2. 讀取 Human3.6M 3D NPZ並套用官方資料前處理。
+    #
+    # read_3d_data：
+    #   世界座標 -> 各攝影機座標，並扣除joint 0（骨盆）位置，
+    #   因此3D答案是骨盆置中、單位為公尺。
+    #
+    # create_2d_data：
+    #   依每台攝影機的解析度，把CPN像素座標正規化成
+    #   IGANet訓練時使用的座標範圍。
+    # --------------------------------------------------------------
+    create_2d_data, read_3d_data, Human36mDataset = (
+        load_h36m_data_helpers()
+    )
+    dataset = read_3d_data(Human36mDataset(args.npz_3d_path))
+    normalized_positions_2d = create_2d_data(
+        args.npz_path,
+        dataset,
+    )
+
+    # 載入六關節 L2D-J_best.pth。模型本身的節點數就是6，
+    # 不是先跑17點之後才把上半身輸出丟掉。
+    print('[NPZ inference mode] Loading IGA model...')
+    iga_model = build_iga_model(args.checkpoint_hybrid, num_frame=1)
+    iga_flops = compute_iga_flops_per_frame(iga_model)
+
+    num_frames = 0
+    num_updates = 0
+    sequence_count = 0
+    joint_error_sum = torch.zeros(6, dtype=torch.float64)
+    total_3d_seconds = 0.0
+
+    # --------------------------------------------------------------
+    # 3. 逐一配對 subject -> action -> camera。
+    #
+    # --camera_idx -1 代表四台攝影機全部驗證。
+    # 每個動作／攝影機都視為獨立序列，不能跨序列沿用PRFK狀態。
+    # --------------------------------------------------------------
+    for subject in subjects:
+        for action_name in sorted(raw_positions_2d[subject]):
+            raw_cameras = raw_positions_2d[subject][action_name]
+            normalized_cameras = normalized_positions_2d[
+                subject
+            ][action_name]
+            gt_cameras = dataset[subject][action_name]['positions_3d']
+            if args.camera_idx == -1:
+                camera_indices = range(len(raw_cameras))
+            elif 0 <= args.camera_idx < len(raw_cameras):
+                camera_indices = [args.camera_idx]
+            else:
+                raise IndexError(
+                    f'Camera {args.camera_idx} is unavailable for '
+                    f'{subject}/{action_name}'
+                )
+
+            for camera_idx in camera_indices:
+                raw_sequence = raw_cameras[camera_idx]
+                normalized_sequence = normalized_cameras[camera_idx]
+                gt_sequence = gt_cameras[camera_idx]
+                # CPN 2D與3D GT有些序列尾端可能相差一幀，
+                # 因此只取兩者共同長度，避免2D與3D答案錯位。
+                sequence_frames = min(
+                    len(raw_sequence),
+                    len(normalized_sequence),
+                    len(gt_sequence),
+                )
+                raw_sequence = raw_sequence[:sequence_frames]
+                normalized_sequence = normalized_sequence[
+                    :sequence_frames
+                ]
+                # --------------------------------------------------
+                # 4. 只從17點3D答案取出下半身六點。
+                #
+                # Human3.6M index：
+                # 1=右髖、2=右膝、3=右腳踝、
+                # 4=左髖、5=左膝、6=左腳踝。
+                #
+                # gt_lower形狀：(frames, 6, 3)
+                # --------------------------------------------------
+                gt_lower = gt_sequence[
+                    :sequence_frames,
+                    L2D_INPUT_H36M_INDICES,
+                    :,
+                ].astype(np.float32)
+
+                sequence_count += 1
+                num_frames += sequence_frames
+
+                # Reset PRFK at every subject/action/camera boundary.
+                frame_plan = build_prfk_update_plan(
+                    raw_sequence,
+                    dist_threshold=args.prfk_dist_threshold,
+                    dir_threshold=args.prfk_dir_threshold,
+                    acc_threshold=args.prfk_acc_threshold,
+                    theta_threshold=args.prfk_theta_threshold,
+                )
+
+                # --------------------------------------------------
+                # 5. 執行六關節2D -> 六關節3D推論。
+                #
+                # normalized_sequence原本是(frames, 17, 2)；
+                # run_iga_inference_batched內會呼叫
+                # select_model_2d_input，只選[1,2,3,4,5,6]，
+                # 真正送入模型的tensor為(batch, 1, 6, 2)。
+                # prediction輸出為(1, frames, 6, 3)。
+                # 終端機的[INPUT CHECK]會印出實際輸入形狀。
+                # --------------------------------------------------
+                prediction, elapsed, updates, _ = (
+                    run_iga_inference_batched(
+                        normalized_sequence,
+                        frame_plan,
+                        iga_model,
+                        use_prfk=True,
+                    )
+                )
+                prediction = prediction[0]
+                gt_tensor = torch.from_numpy(gt_lower)
+                # --------------------------------------------------
+                # 6. 計算每幀、每關節的Protocol #1 MPJPE。
+                #
+                # ||預測3D - 3D答案||_2，先保留六個關節各自誤差，
+                # 最後再對所有S9+S11幀數做加權平均並轉成毫米。
+                # --------------------------------------------------
+                joint_errors = torch.linalg.vector_norm(
+                    prediction - gt_tensor,
+                    dim=-1,
+                )
+                joint_error_sum += joint_errors.double().sum(dim=0)
+                num_updates += updates
+                total_3d_seconds += elapsed
+
+    baseline_total = num_frames * iga_flops
+    prfk_total = num_updates * iga_flops
+    arithmetic_flops_total = 2.0 * prfk_total
+    baseline_per_frame = baseline_total / num_frames
+    prfk_per_frame = prfk_total / num_frames
+    # 每個關節的總誤差 / 全部有效幀數，再由公尺轉成毫米。
+    per_joint_mpjpe = joint_error_sum / num_frames * 1000.0
+    # 六個關節MPJPE的平均就是最後的下半身六點MPJPE。
+    combined_mpjpe = per_joint_mpjpe.mean().item()
+
+    print('=' * 70)
+    print(f'2D input: {args.npz_path}')
+    print(f'3D ground truth: {args.npz_3d_path}')
+    print(
+        f'Subjects: {",".join(subjects)} | '
+        f'camera index: {args.camera_idx} '
+        f'| sequences: {sequence_count}'
+    )
+    print(
+        'PRFK thresholds: '
+        f'distance={args.prfk_dist_threshold:g}, '
+        f'direction={args.prfk_dir_threshold:g}, '
+        f'acceleration={args.prfk_acc_threshold:g}, '
+        f'theta={args.prfk_theta_threshold:g}'
+    )
+    print('Model input per frame: (1, 1, 6, 2)')
+    print('Model output per frame: (1, 1, 6, 3)')
+    print(
+        'Joint order: '
+        '[R-Hip, R-Knee, R-Ankle, L-Hip, L-Knee, L-Ankle]'
+    )
+    print(f'Total executed frames: {num_frames}')
+    print(f'IGA updates: {num_updates}; skips: {num_frames - num_updates}')
+    print(f'IGA per update: {iga_flops / 1e9:.6f} GMac')
+    print(f'Baseline total: {baseline_total / 1e12:.6f} TMac')
+    print(
+        f'Baseline total / total frames: '
+        f'{baseline_per_frame / 1e9:.6f} GMac/frame'
+    )
+    print(f'PRFK-gated total: {prfk_total / 1e12:.6f} TMac')
+    print(
+        f'Total arithmetic FLOPs (1 MAC = 2 FLOPs): '
+        f'{arithmetic_flops_total / 1e12:.6f} TFLOPs'
+    )
+    print(
+        f'PRFK-gated total / total frames: '
+        f'{prfk_per_frame / 1e6:.6f} MMac/frame'
+    )
+    print(
+        f'Arithmetic FLOPs per frame (1 MAC = 2 FLOPs): '
+        f'{2.0 * prfk_per_frame / 1e6:.6f} MFLOPs/frame'
+    )
+    joint_names = [
+        'R-Hip',
+        'R-Knee',
+        'R-Ankle',
+        'L-Hip',
+        'L-Knee',
+        'L-Ankle',
+    ]
+    print('=' * 70)
+    print('FINAL SIX-JOINT VALIDATION MPJPE (S9+S11)')
+    print('=' * 70)
+    for joint_name, error in zip(joint_names, per_joint_mpjpe):
+        print(f'{joint_name:<8}: {error.item():.6f} mm')
+    print(f'Combined lower-body MPJPE: {combined_mpjpe:.6f} mm')
+    print(f'Actual 3D inference time: {total_3d_seconds:.3f} s')
+    print(
+        f'Average 3D inference time: '
+        f'{total_3d_seconds / num_frames * 1000.0:.6f} ms/frame'
+    )
+    return
+
 
 
 if __name__ == '__main__':
