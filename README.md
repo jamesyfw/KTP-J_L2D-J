@@ -8,7 +8,7 @@
 
 ### KTP-J
 
-使用目前程式內的預設 PRFK 設定執行：
+使用 Human3.6M 的 S9、S11 與全部4台攝影機進行驗證：
 
 ```bash
 python "3DKTP_from_images(1-6).py"
@@ -19,7 +19,5 @@ python "3DKTP_from_images(1-6).py"
 使用 Human3.6M 的 S9、S11 與全部4台攝影機進行驗證：
 
 ```bash
-python "3DIGA_from_images(1-6).py" --npz_path "data/data_2d_h36m_cpn_ft_h36m_dbb.npz" --npz_3d_path "data/data_3d_h36m.npz" --subject "S9,S11" --camera_idx -1
+python "3DIGA_from_images(1-6).py"
 ```
-
-> 目前 KTP-J 的 NPZ 驗證流程尚未接入 PRFK，因此 KTP-J 的上述基本指令使用圖片輸入流程；L2D-J 則可以直接使用 NPZ 驗證 PRFK。
