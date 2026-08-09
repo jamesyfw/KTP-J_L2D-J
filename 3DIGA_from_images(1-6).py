@@ -554,7 +554,7 @@ IGA_MODEL_PATH = os.path.join(PROJECT_ROOT, 'IGANet_8_4834.pth')
 L2D_MODEL_PATH = os.path.join(
     PROJECT_ROOT,
     'checkpoint_hybrid',
-    'L2D_best.pth',
+    'L2D-J_best.pth',
 )
 H36M_3D_NPZ_PATH = os.path.join(
     PROJECT_ROOT,
@@ -584,7 +584,7 @@ L2D_INPUT_H36M_INDICES = [1, 2, 3, 4, 5, 6]
 
 
 class LowerBodyIGANet(nn.Module):
-    """Six-joint IGANet architecture used by L2D_best.pth."""
+    """Six-joint IGANet architecture used by L2D-J_best.pth."""
 
     def __init__(self, depth=3, channel=512):
         super().__init__()
@@ -1615,7 +1615,7 @@ def evaluate():
     )
     parser.add_argument('--pose3d', type=str, default=POSE3D_PATH, help='Path to 3D GT JSON')
     parser.add_argument(
-        '--iga_checkpoint',
+        '--checkpoint_hybrid',
         type=str,
         default=L2D_MODEL_PATH,
         help='Path to original 17-joint or six-joint L2D IGA checkpoint',
@@ -1654,7 +1654,7 @@ def evaluate():
             ).astype(np.float32)
 
         print('[Custom 2D inference mode] Loading IGA model...')
-        iga_model = build_iga_model(args.iga_checkpoint, num_frame=1)
+        iga_model = build_iga_model(args.checkpoint_hybrid, num_frame=1)
         frame_plan = [
             {'any_update': True}
             for _ in range(len(custom_2d_norm))
@@ -1730,10 +1730,10 @@ def evaluate():
             dataset,
         )
 
-        # 載入六關節 L2D_best.pth。模型本身的節點數就是6，
+        # 載入六關節 L2D-J_best.pth。模型本身的節點數就是6，
         # 不是先跑17點之後才把上半身輸出丟掉。
         print('[NPZ inference mode] Loading IGA model...')
-        iga_model = build_iga_model(args.iga_checkpoint, num_frame=1)
+        iga_model = build_iga_model(args.checkpoint_hybrid, num_frame=1)
         iga_flops = compute_iga_flops_per_frame(iga_model)
 
         num_frames = 0
@@ -1961,7 +1961,7 @@ def evaluate():
     pts_3d_cam_rel[:, 0, :] = 0  # Explicitly set root to origin
 
     print("[4/6] Loading IGA model...")
-    iga_model = build_iga_model(args.iga_checkpoint, num_frame=1)  # Single-frame model
+    iga_model = build_iga_model(args.checkpoint_hybrid, num_frame=1)  # Single-frame model
 
     detector_flops, iga_flops = summarize_pipeline_flops(iga_model)
 

@@ -544,7 +544,7 @@ FULLBODY_WINDOW = 243
 HYBRID_CHECKPOINT_PATH = os.path.join(
     PROJECT_ROOT,
     'checkpoint_hybrid',
-    'L2D_KTP_best.bin',
+    'KTP-J_best.bin',
 )
 H36M_3D_NPZ_PATH = os.path.join(
     PROJECT_ROOT,
@@ -1407,7 +1407,7 @@ def run_npz_hybrid_validation(args):
 
     print('[NPZ Hybrid validation] Loading model...', flush=True)
     model, device, epoch, macs_per_call, params = (
-        build_validation_hybrid_model(args.hybrid_checkpoint)
+        build_validation_hybrid_model(args.checkpoint_hybrid)
     )
     print(
         f'[INFO] Strict checkpoint load passed | epoch={epoch} | '
@@ -1621,7 +1621,7 @@ def run_npz_hybrid_validation(args):
     print('=' * 72)
     print(f'2D input: {args.npz_path}')
     print(f'3D ground truth: {args.npz_3d_path}')
-    print(f'Checkpoint: {args.hybrid_checkpoint}')
+    print(f'Checkpoint: {args.checkpoint_hybrid}')
     print(
         f'Subjects: {",".join(subjects)} | camera index: '
         f'{args.camera_idx} | sequences: {sequence_count}'
@@ -1705,7 +1705,7 @@ def evaluate():
         help='Camera index, or -1 for all cameras',
     )
     parser.add_argument(
-        '--hybrid_checkpoint',
+        '--checkpoint_hybrid',
         type=str,
         default=HYBRID_CHECKPOINT_PATH,
         help='True six-joint 243-frame KTPFormer checkpoint',
